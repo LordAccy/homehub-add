@@ -63,6 +63,9 @@
       <button id="scanBtn" type="button">📷 Scan QR code or barcode</button>
       <div id="reader"></div>
       <div class="msg" id="scanMsg">Point the camera at the QR code or barcode on the slab label.</div>
+      <div style="margin-top:10px"><button id="ocrBtn" type="button">🔤 Read the label from a photo</button>
+        <input id="ocrFile" type="file" accept="image/*" capture="environment" class="hidden"></div>
+      <div class="msg" id="ocrMsg">Take a close photo of just the label to fill in the card name, number and grade.</div>
       <div class="row">
         <div><label for="grader">Grading company</label>
           <select id="grader"><option>ACE</option><option>PSA</option><option>CGC</option><option>BGS</option><option>TAG</option><option>SGC</option></select></div>
@@ -164,6 +167,192 @@
     setMsg('findMsg', 'Type the Pokémon’s name (and number) below to find the card.');
     if (!$('grade').value) $('grade').focus();
   }
+
+  // ---------- reading the printed label (text recognition on the phone) ----------
+  // Tesseract.js runs on the phone itself; the photo is never uploaded. First use
+  // downloads the library and ~3 MB of English data from jsDelivr (then cached).
+  var TESS = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/';
+  var ocrLibP = null, ocrWorkerP = null, ocrProgress = null;
+  function ocrWorker() {
+    ocrLibP = ocrLibP || new Promise(function (res, rej) {
+      var s = document.createElement('script'); s.src = TESS + 'tesseract.min.js';
+      s.onload = function () { res(window.Tesseract); };
+      s.onerror = function () { ocrLibP = null; rej(new Error('couldn’t download the text reader')); };
+      document.head.appendChild(s);
+    });
+    ocrWorkerP = ocrWorkerP || ocrLibP.then(function (T) {
+      return T.createWorker('eng', 1, {
+        workerPath: TESS + 'worker.min.js',
+        corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+        langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+        logger: function (m) { if (ocrProgress) ocrProgress(m); }
+      });
+    }).catch(function (e) { ocrWorkerP = null; throw e; });
+    return ocrWorkerP;
+  }
+  // Photo → greyscale, contrast-stretched canvas about 1600px wide (small print reads better bigger).
+  // mode 'light': keep only near-white pixels as black ink, for white lettering on artwork.
+  function prepImage(file, mode) {
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () {
+        var scale = Math.min(2.5, 1600 / img.width), w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        var c = document.createElement('canvas'); c.width = w; c.height = h;
+        var g = c.getContext('2d'); g.drawImage(img, 0, 0, w, h);
+        var d = g.getImageData(0, 0, w, h), p = d.data, lo = 255, hi = 0, i, v;
+        for (i = 0; i < p.length; i += 4) { v = 0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2]; p[i] = v; if (v < lo) lo = v; if (v > hi) hi = v; }
+        var k = hi > lo ? 255 / (hi - lo) : 1;
+        for (i = 0; i < p.length; i += 4) {
+          v = (p[i] - lo) * k;
+          if (mode === 'light') v = v > 215 ? 0 : 255;
+          p[i] = p[i + 1] = p[i + 2] = v;
+        }
+        g.putImageData(d, 0, 0); URL.revokeObjectURL(url); res(c);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('couldn’t open that photo')); };
+      img.src = url;
+    });
+  }
+  // Labels read like: "2022 BRILLIANT STARS / ARCEUS V / SPECIAL ART / #166 ... 9 MINT ... 668463"
+  function parseLabelText(text) {
+    var lines = String(text || '').split('\n').map(function (l) {
+      return l.replace(/[|_~`"“”‘’«»<>{}\[\]]/g, ' ').replace(/\s+/g, ' ').trim();
+    }).filter(function (l) { return /[A-Za-z0-9]{2}/.test(l); });
+    var out = { lines: lines }, all = lines.join('\n');
+    var num = all.match(/#\s*([A-Z]{0,5}\s?0*\d{1,4})/i);
+    if (num) out.number = String(parseInt(num[1].replace(/\D/g, ''), 10));
+    // The first line is "<year> <set>", though the reader often glues junk on: "82016/BREAKPOINT", "2001[SOUTHERN…".
+    var yi = -1, ym = null;
+    lines.some(function (l, i) { ym = l.match(/(19[89]\d|20[0-3]\d)[^A-Za-z]{0,3}([A-Za-z].*)$/); if (ym) { yi = i; return true; } return false; });
+    var skip = /^(#|gem|mint|near|nm|pristine|auth|good|fair|poor|very|vg|ace\b)/i;
+    if (yi >= 0) {
+      out.year = ym[1];
+      out.set = ym[2].replace(/[^A-Za-z&' ]/g, ' ').replace(/\s+/g, ' ').trim();
+      for (var j = yi + 1; j < lines.length; j++) {
+        var cand = lines[j].replace(/[^A-Za-z0-9 '’.:-]/g, ' ').replace(/\s+/g, ' ').trim();
+        // keep the leading words, drop trailing short junk and grade digits ("ESPEON EX +9 E" → "ESPEON EX")
+        var words = cand.split(' '), keep = [];
+        for (var w = 0; w < words.length; w++) {
+          if (/^[A-Za-z][A-Za-z'’.:-]*$/.test(words[w]) && (words[w].length > 1 || /^[VX]$/i.test(words[w]))) keep.push(words[w]);
+          else if (keep.length) break;
+        }
+        cand = keep.join(' ');
+        if (cand.replace(/[^A-Za-z]/g, '').length >= 3 && !skip.test(cand)) { out.name = cand; break; }
+      }
+    }
+    var certs = all.match(/\b\d{6,8}\b/g);
+    if (certs) out.cert = certs[certs.length - 1];
+    var gl = lines.filter(function (l) { return /^(10|[1-9](\.5)?)$/.test(l); })[0];
+    var gw = all.match(/\b(10|[1-9](?:\.5)?)\s*(?:\n\s*)?(GEM\s*MINT|PRISTINE|MINT|NEAR\s*MINT|NM)/i);
+    if (gl) out.grade = gl; else if (gw) out.grade = gw[1];
+    else if (/GEM\s*-?\s*MINT|PRISTINE/i.test(all)) out.grade = '10';
+    else if (/\bMINT\b/i.test(all) && !/NEAR\s*MINT|NM/i.test(all)) out.grade = '9';
+    return out;
+  }
+  // ---------- matching the label to a card: set name + card number ----------
+  // The card name is the least reliable thing the reader gets, so match on the
+  // set (fuzzy: "BRIULIANT STARS" → Brilliant Stars) plus the card number, and
+  // use the name and year only to break ties.
+  function letters(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  function dice(a, b) {
+    a = letters(a); b = letters(b);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+    var x = [], y = [], i, m = 0;
+    for (i = 0; i < a.length - 1; i++) x.push(a.substr(i, 2));
+    for (i = 0; i < b.length - 1; i++) y.push(b.substr(i, 2));
+    x.forEach(function (g) { var k = y.indexOf(g); if (k >= 0) { m++; y.splice(k, 1); } });
+    return 2 * m / (a.length - 1 + b.length - 1);
+  }
+  // best score of the set text, or of its first 1..n words (trailing junk is common), against a set name
+  function setScore(text, setName) {
+    var words = String(text || '').split(' ').filter(Boolean), best = 0;
+    for (var n = 1; n <= words.length; n++) best = Math.max(best, dice(words.slice(0, n).join(' '), setName));
+    var plain = String(setName).replace(/^(sv|swsh|sm|xy|bw|dp|hgss|mep|me)\s+/i, '');
+    if (plain !== setName) for (n = 1; n <= words.length; n++) best = Math.max(best, dice(words.slice(0, n).join(' '), plain));
+    return best;
+  }
+  var setInfo = {};
+  function tcgSet(id) {
+    setInfo[id] = setInfo[id] || fetch(TCGDEX + 'sets/' + encodeURIComponent(id)).then(function (r) { return r.json(); }).catch(function () { delete setInfo[id]; return null; });
+    return setInfo[id];
+  }
+  function matchBySetNumber(p) {
+    var num = parseInt(p.number, 10);
+    if (!p.set || isNaN(num)) return Promise.resolve([]);
+    return tcgSets().then(function (sets) {
+      var scored = sets.map(function (s) { return { s: s, sc: setScore(p.set, s.name) }; })
+        .filter(function (x) { return x.sc >= 0.6; }).sort(function (a, b) { return b.sc - a.sc; }).slice(0, 8);
+      return Promise.all(scored.map(function (x) {
+        return tcgSet(x.s.id).then(function (set) {
+          if (!set || !set.cards) return null;
+          var card = set.cards.filter(function (c) { return parseInt(c.localId, 10) === num; })[0];
+          if (!card) return null;
+          var yr = String(set.releaseDate || '').slice(0, 4);
+          var score = x.sc + (p.year && yr === p.year ? 0.3 : 0) + (p.name ? 0.5 * dice(p.name, card.name) : 0);
+          return { card: card, score: score, setName: set.name };
+        });
+      }));
+    }).then(function (list) { return list.filter(Boolean).sort(function (a, b) { return b.score - a.score; }); });
+  }
+  function readPhoto(f, mode) {
+    return Promise.all([ocrWorker(), prepImage(f, mode)]).then(function (r) { return r[0].recognize(r[1]); })
+      .then(function (res) { return parseLabelText(res.data && res.data.text); });
+  }
+  function niceName(s) {
+    return String(s || '').toLowerCase().replace(/\b([a-z])/g, function (m) { return m.toUpperCase(); })
+      .replace(/\b(Vmax|Vstar|Gx|V)\b/g, function (m) { return m.toUpperCase(); }).replace(/\bEx\b/g, 'ex');
+  }
+  $('ocrBtn').addEventListener('click', function () { $('ocrFile').click(); });
+  $('ocrFile').addEventListener('change', function () {
+    var f = $('ocrFile').files && $('ocrFile').files[0];
+    $('ocrFile').value = '';
+    if (!f) return;
+    $('ocrBtn').disabled = true;
+    setMsg('ocrMsg', 'Getting the text reader ready (the first time takes a little while)…');
+    ocrProgress = function (m) {
+      if (m.status === 'recognizing text') setMsg('ocrMsg', 'Reading the label… ' + Math.round((m.progress || 0) * 100) + '%');
+      else if (/load/i.test(m.status || '')) setMsg('ocrMsg', 'Getting the text reader ready… ' + Math.round((m.progress || 0) * 100) + '%');
+    };
+    readPhoto(f, 'normal').then(function (p) {
+      // Light text on artwork (special-art labels) needs a second pass that keeps only the bright letters.
+      if (p.set && p.number) return p;
+      setMsg('ocrMsg', 'Reading the label again for light-coloured text…');
+      return readPhoto(f, 'light').then(function (q) {
+        ['set', 'year', 'number', 'name', 'grade', 'cert'].forEach(function (k) { if (!p[k] && q[k]) p[k] = q[k]; });
+        return p;
+      });
+    }).then(function (p) {
+      if (p.cert && !$('cert').value) $('cert').value = p.cert;
+      if (p.grade && !$('grade').value) { $('grade').value = p.grade; syncGrades(); }
+      check();
+      var name = p.name ? niceName(p.name) : '';
+      var read = [p.year, p.set, name, p.number ? '#' + p.number : '', p.grade ? 'grade ' + p.grade : ''].filter(Boolean).join(', ');
+      if (!p.set && !name) {
+        setMsg('ocrMsg', 'Couldn’t make out the label. Try a closer, straight-on photo of just the label, without glare, or type the name below.', 'bad');
+        return;
+      }
+      setMsg('ocrMsg', 'Read: ' + read, 'ok');
+      setMsg('findMsg', 'Finding the card…'); $('results').innerHTML = ''; picked = null; showPicked(); check();
+      return matchBySetNumber(p).then(function (m) {
+        if (m.length) {
+          var clear = m.length === 1 || m[0].score - m[1].score >= 0.25;
+          $('q').value = m[0].card.name + ' ' + parseInt(p.number, 10);
+          renderResults(m.map(function (x) { return x.card; }), clear ? m[0].card : null);
+          setMsg('findMsg', clear ? 'Matched the label to ' + m[0].card.name + ' (' + m[0].setName + ' #' + m[0].card.localId + '). Check the picture is right, or tap another.'
+            : 'The label could be one of these. Tap yours.', clear ? 'ok' : '');
+          return;
+        }
+        // No set + number match: fall back to the name, but never pick one automatically.
+        if (!name) { setMsg('findMsg', 'Couldn’t match the label to a card. Type the name below.', 'bad'); return; }
+        $('q').value = name + (p.number ? ' ' + parseInt(p.number, 10) : '');
+        doFind({ set: p.set || '', fallbackName: name.split(' ')[0], label: name, source: 'Label', noAuto: true });
+      });
+    }).catch(function (e) {
+      setMsg('ocrMsg', 'Couldn’t read the label (' + (e && e.message || e) + '). Type the card name below.', 'bad');
+    }).then(function () { $('ocrBtn').disabled = false; ocrProgress = null; });
+  });
 
   // ---------- asking the TV to read the grader's cert page ----------
   // Grader sites don't let other web pages read them, but Home Hub on the TV
@@ -270,7 +459,8 @@
     if (!q) return;
     $('q').blur();
     picked = null; showPicked(); check();
-    setMsg('findMsg', hint ? 'Found on Ace: ' + hint.label + '. Finding the card…' : 'Searching…'); $('results').innerHTML = '';
+    var src = hint ? (hint.source || 'Ace') + ' says: ' + hint.label + '. ' : '';
+    setMsg('findMsg', hint ? src + 'Finding the card…' : 'Searching…'); $('results').innerHTML = '';
     findCards(q).then(function (list) {
       // the label's number didn't match: try just the name
       if (!list.length && hint && hint.fallbackName && hint.fallbackName !== q) { $('q').value = hint.fallbackName; return findCards(hint.fallbackName); }
@@ -283,26 +473,32 @@
       if (hint) {
         var inSet = list.filter(function (c) { return sameSet(c.id, hint.set, r.sets); });
         list = inSet.concat(list.filter(function (c) { return inSet.indexOf(c) < 0; }));
-        if (inSet.length === 1) auto = inSet[0];
-        else if (list.length === 1) auto = list[0];
+        if (!hint.noAuto) {
+          if (inSet.length === 1) auto = inSet[0];
+          else if (list.length === 1) auto = list[0];
+        }
       }
-      if (auto) setMsg('findMsg', 'Ace says: ' + hint.label + '. I’ve picked the matching card. Check the picture is right, or tap another.', 'ok');
-      else setMsg('findMsg', (hint ? 'Ace says: ' + hint.label + '. ' : '') + list.length + (list.length === 48 ? '+' : '') + ' cards. Tap yours.');
-      list.forEach(function (c) {
-        var d = document.createElement('div'); d.className = 'card';
-        var img = document.createElement('img'); img.loading = 'lazy'; img.alt = c.name;
-        if (c.image) img.src = c.image + '/low.webp'; else img.style.visibility = 'hidden';
-        img.onerror = function () { img.style.visibility = 'hidden'; };
-        var cap = document.createElement('div'); cap.textContent = c.name + ' · ' + setCodeOf(c) + ' #' + c.localId;
-        d.appendChild(img); d.appendChild(cap);
-        d.addEventListener('click', function () {
-          [].forEach.call($('results').children, function (x) { x.classList.remove('on'); });
-          d.classList.add('on'); picked = c; showPicked(); check();
-        });
-        $('results').appendChild(d);
-        if (c === auto) { d.classList.add('on'); picked = c; showPicked(); check(); }
-      });
+      if (auto) setMsg('findMsg', src + 'I’ve picked the matching card. Check the picture is right, or tap another.', 'ok');
+      else setMsg('findMsg', src + list.length + (list.length === 48 ? '+' : '') + ' cards. Tap yours.');
+      renderResults(list, auto);
     }).catch(function (e) { setMsg('findMsg', 'Search failed (' + e.message + '). Check your connection.', 'bad'); });
+  }
+  function renderResults(list, auto) {
+    $('results').innerHTML = '';
+    list.forEach(function (c) {
+      var d = document.createElement('div'); d.className = 'card';
+      var img = document.createElement('img'); img.loading = 'lazy'; img.alt = c.name;
+      if (c.image) img.src = c.image + '/low.webp'; else img.style.visibility = 'hidden';
+      img.onerror = function () { img.style.visibility = 'hidden'; };
+      var cap = document.createElement('div'); cap.textContent = c.name + ' · ' + setCodeOf(c) + ' #' + c.localId;
+      d.appendChild(img); d.appendChild(cap);
+      d.addEventListener('click', function () {
+        [].forEach.call($('results').children, function (x) { x.classList.remove('on'); });
+        d.classList.add('on'); picked = c; showPicked(); check();
+      });
+      $('results').appendChild(d);
+      if (c === auto) { d.classList.add('on'); picked = c; showPicked(); check(); }
+    });
   }
   function showPicked() {
     var el = $('chosen'); el.innerHTML = '';
