@@ -158,8 +158,63 @@
     } else {
       var s = document.createElement('div'); s.className = 'raw'; s.textContent = 'Scanned: ' + p.raw; $('certLink').appendChild(s);
     }
-    if (!$('grade').value) $('grade').focus();
     check();
+    if ($('grader').value === 'ACE' && $('cert').value) lookupViaTv('ACE', $('cert').value);
+    else if (!$('grade').value) $('grade').focus();
+  }
+
+  // ---------- asking the TV to read the grader's cert page ----------
+  // Grader sites don't let other web pages read them, but Home Hub on the TV
+  // can. Post a lookup request to the TV's channel and wait for its answer on
+  // <channel>-r. Needs the "Add from your phone" screen open on the TV.
+  var lookupSeq = 0;
+  function lookupViaTv(grader, cert) {
+    var mine = ++lookupSeq;
+    var reqId = (Math.random().toString(36).slice(2, 10) + Date.now().toString(36)).replace(/[^a-z0-9]/g, '').slice(0, 20);
+    var since = Math.floor(Date.now() / 1000) - 5, deadline = Date.now() + 20000;
+    setMsg('findMsg', 'Asking your TV to look up cert ' + cert + ' on Ace’s website…');
+    function poll() {
+      if (mine !== lookupSeq) return Promise.resolve(null);
+      return fetch(RELAY + channel + '-r/json?poll=1&since=' + since).then(function (r) { return r.text(); }).then(function (txt) {
+        var hit = null;
+        txt.split('\n').forEach(function (l) {
+          try { var e = JSON.parse(l), m = e.event === 'message' ? JSON.parse(e.message) : null; if (m && m.reqId === reqId) hit = m; } catch (x) {}
+        });
+        if (hit) return hit;
+        if (Date.now() > deadline) return null;
+        return new Promise(function (res) { setTimeout(res, 2000); }).then(poll);
+      });
+    }
+    fetch(RELAY + channel, { method: 'POST', body: JSON.stringify({ v: 1, type: 'lookup', reqId: reqId, grader: grader, cert: cert }) })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return poll(); })
+      .then(function (res) {
+        if (mine !== lookupSeq) return;
+        if (!res) { setMsg('findMsg', 'Your TV didn’t answer. Make sure “Add from your phone” is open on the TV, or type the card name below.', 'bad'); return; }
+        if (!res.ok) { setMsg('findMsg', 'Couldn’t look it up (' + (res.error || 'unknown error') + '). Type the card name below.', 'bad'); return; }
+        if (/^(10|[1-9](\.5)?)$/.test(String(res.grade || '')) && !$('grade').value) { $('grade').value = res.grade; syncGrades(); check(); }
+        var num = parseInt(String(res.number || '').split('/')[0].replace(/\D/g, ''), 10);
+        $('q').value = res.name + (isNaN(num) ? '' : ' ' + num);
+        var label = [res.name, res.set, res.number ? '#' + res.number : '', res.grade ? 'grade ' + res.grade : ''].filter(Boolean).join(', ');
+        doFind({ set: res.set, fallbackName: res.name, label: label });
+      })
+      .catch(function (e) { if (mine === lookupSeq) setMsg('findMsg', 'Couldn’t ask your TV (' + e.message + '). Type the card name below.', 'bad'); });
+  }
+  // TCGdex set names, to pick the right card when the label names its set.
+  var setsP = null;
+  function tcgSets() {
+    setsP = setsP || fetch(TCGDEX + 'sets').then(function (r) { return r.json(); }).catch(function () { setsP = null; return []; });
+    return setsP;
+  }
+  function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '').replace(/s$/, ''); }
+  function sameSet(cardId, setName, sets) {
+    var want = norm(setName);
+    if (!want) return false;
+    var setId = String(cardId).split('-').slice(0, -1).join('-').toLowerCase();
+    return sets.some(function (s) {
+      if (String(s.id).toLowerCase() !== setId) return false;
+      var have = norm(s.name);
+      return have === want || have.indexOf(want) >= 0 || want.indexOf(have) >= 0;
+    });
   }
   function stopScan() {
     if (!scanner || !scanning) return Promise.resolve();
@@ -206,14 +261,31 @@
     }).then(function (l) { return l.slice(0, 48); });
   }
   function setCodeOf(c) { var p = String(c.id).split('-'); p.pop(); return p.join('-').toUpperCase(); }
-  function doFind() {
+  // hint (from a label lookup): {set, fallbackName, label}
+  function doFind(hint) {
+    hint = hint && hint.set !== undefined ? hint : null;
     var q = $('q').value.trim();
     if (!q) return;
     $('q').blur();
-    setMsg('findMsg', 'Searching…'); $('results').innerHTML = '';
+    picked = null; showPicked(); check();
+    setMsg('findMsg', hint ? 'Found on Ace: ' + hint.label + '. Finding the card…' : 'Searching…'); $('results').innerHTML = '';
     findCards(q).then(function (list) {
-      if (!list.length) { setMsg('findMsg', 'No cards found for “' + q + '”. Check the spelling, or try just the name.', 'bad'); return; }
-      setMsg('findMsg', list.length + (list.length === 48 ? '+' : '') + ' cards. Tap yours.');
+      // the label's number didn't match: try just the name
+      if (!list.length && hint && hint.fallbackName && hint.fallbackName !== q) { $('q').value = hint.fallbackName; return findCards(hint.fallbackName); }
+      return list;
+    }).then(function (list) {
+      return (hint ? tcgSets() : Promise.resolve([])).then(function (sets) { return { list: list, sets: sets }; });
+    }).then(function (r) {
+      var list = r.list, auto = null;
+      if (!list.length) { setMsg('findMsg', 'No cards found for “' + $('q').value + '”. Check the spelling, or try just the name.', 'bad'); return; }
+      if (hint) {
+        var inSet = list.filter(function (c) { return sameSet(c.id, hint.set, r.sets); });
+        list = inSet.concat(list.filter(function (c) { return inSet.indexOf(c) < 0; }));
+        if (inSet.length === 1) auto = inSet[0];
+        else if (list.length === 1) auto = list[0];
+      }
+      if (auto) setMsg('findMsg', 'Ace says: ' + hint.label + '. I’ve picked the matching card. Check the picture is right, or tap another.', 'ok');
+      else setMsg('findMsg', (hint ? 'Ace says: ' + hint.label + '. ' : '') + list.length + (list.length === 48 ? '+' : '') + ' cards. Tap yours.');
       list.forEach(function (c) {
         var d = document.createElement('div'); d.className = 'card';
         var img = document.createElement('img'); img.loading = 'lazy'; img.alt = c.name;
@@ -226,6 +298,7 @@
           d.classList.add('on'); picked = c; showPicked(); check();
         });
         $('results').appendChild(d);
+        if (c === auto) { d.classList.add('on'); picked = c; showPicked(); check(); }
       });
     }).catch(function (e) { setMsg('findMsg', 'Search failed (' + e.message + '). Check your connection.', 'bad'); });
   }
@@ -233,7 +306,15 @@
     var el = $('chosen'); el.innerHTML = '';
     if (!picked) { el.classList.add('hidden'); return; }
     el.classList.remove('hidden');
-    if (picked.image) { var i = document.createElement('img'); i.src = picked.image + '/low.webp'; i.alt = ''; el.appendChild(i); }
+    // ACE publishes a photo of the actual slab for most certs: show that, else the card picture.
+    var cert = $('cert').value.trim(), cardPic = picked.image ? picked.image + '/low.webp' : '';
+    var slabPic = $('grader').value === 'ACE' && /^\d{4,12}$/.test(cert) ?
+      'https://collectible-images.ams3.cdn.digitaloceanspaces.com/public/collectible/' + cert + '/' + cert + '_front.webp' : '';
+    if (slabPic || cardPic) {
+      var i = document.createElement('img'); i.alt = '';
+      i.onerror = function () { if (cardPic && i.src !== cardPic) i.src = cardPic; else i.remove(); };
+      i.src = slabPic || cardPic; el.appendChild(i);
+    }
     var t = document.createElement('div'); t.innerHTML = '<b></b><br><span class="msg"></span>';
     t.querySelector('b').textContent = picked.name; t.querySelector('span').textContent = setCodeOf(picked) + ' · #' + picked.localId;
     el.appendChild(t);
