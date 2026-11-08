@@ -159,8 +159,10 @@
       var s = document.createElement('div'); s.className = 'raw'; s.textContent = 'Scanned: ' + p.raw; $('certLink').appendChild(s);
     }
     check();
-    if ($('grader').value === 'ACE' && $('cert').value) lookupViaTv('ACE', $('cert').value);
-    else if (!$('grade').value) $('grade').focus();
+    // Looking the cert up on Ace's website is switched off: the site blocks
+    // automated requests. lookupViaTv() is kept but unused.
+    setMsg('findMsg', 'Type the Pokémon’s name (and number) below to find the card.');
+    if (!$('grade').value) $('grade').focus();
   }
 
   // ---------- asking the TV to read the grader's cert page ----------
